@@ -1,0 +1,9 @@
+#Miscellaneous
+*.sublime-workspace
+*.sublime-project
+*.code-workspace
+assets/
+
+# Hidden files
+.credentials
+.bashrc
