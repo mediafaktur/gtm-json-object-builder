@@ -1,4 +1,4 @@
-﻿___INFO___
+___INFO___
 
 {
   "type": "MACRO",
@@ -139,6 +139,135 @@ ___TEMPLATE_PARAMETERS___
   },
   {
     "type": "GROUP",
+    "name": "groupTransforms",
+    "displayName": "Value Transforms",
+    "groupStyle": "ZIPPY_CLOSED",
+    "subParams": [
+      {
+        "type": "LABEL",
+        "name": "transformIntro",
+        "displayName": "Optional. Rewrite sentinel or placeholder values (e.g. \"not set\") before empty values are dropped and types are applied. Rules are split into Rule Keys and Rule Actions, linked by the same Rule ID — one key rule can have several match values. The first matching rule wins. Nested group fields use the path groupName.jsonKey (e.g. user.id)."
+      },
+      {
+        "type": "LABEL",
+        "name": "transformKeysIntro",
+        "displayName": "Rule Keys — which fields a rule targets, and how match values are compared. Reuse the same Rule ID in Rule Actions. Key Scope: All keys · Key prefix (e.g. form_) · Key list (comma-separated exact names, e.g. a, b) · Exact key. Key Pattern is required for prefix, list, and exact (leave empty for All keys). Case applies to every action with this Rule ID: Ignore case trims and ignores casing; Case-sensitive compares the raw string."
+      },
+      {
+        "type": "SIMPLE_TABLE",
+        "name": "builderTransformRuleKeys",
+        "displayName": "Rule Keys",
+        "help": "Each row defines one key-targeting rule. Case applies to every Rule Action that shares this Rule ID.",
+        "simpleTableColumns": [
+          {
+            "defaultValue": "",
+            "displayName": "Rule ID",
+            "name": "transformRuleId",
+            "type": "TEXT"
+          },
+          {
+            "defaultValue": "all",
+            "displayName": "Key Scope",
+            "name": "transformKeyScope",
+            "type": "SELECT",
+            "selectItems": [
+              {
+                "value": "all",
+                "displayValue": "All keys"
+              },
+              {
+                "value": "prefix",
+                "displayValue": "Key prefix"
+              },
+              {
+                "value": "list",
+                "displayValue": "Key list"
+              },
+              {
+                "value": "exact",
+                "displayValue": "Exact key"
+              }
+            ]
+          },
+          {
+            "defaultValue": "",
+            "displayName": "Key Pattern",
+            "name": "transformKeyPattern",
+            "type": "TEXT"
+          },
+          {
+            "defaultValue": "exact_ci",
+            "displayName": "Case",
+            "name": "transformMatchMode",
+            "type": "SELECT",
+            "selectItems": [
+              {
+                "value": "exact_ci",
+                "displayValue": "Ignore case"
+              },
+              {
+                "value": "exact",
+                "displayValue": "Case-sensitive"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "LABEL",
+        "name": "transformActionsIntro",
+        "displayName": "Rule Actions — for each Rule ID, the value to match and what to do. Several rows may share one Rule ID (e.g. not set and (not set)). Match Value is the raw value to detect. Action: Set null keeps the key as JSON null · Omit key drops the key · Replace uses Replace With. Note: BigQuery Data Dispatcher typically omits null keys from the payload — use Omit if you only need BQ output without those keys."
+      },
+      {
+        "type": "SIMPLE_TABLE",
+        "name": "builderTransformRuleActions",
+        "displayName": "Rule Actions",
+        "help": "Multiple action rows may use the same Rule ID. They are evaluated in table order after the matching Rule Key.",
+        "simpleTableColumns": [
+          {
+            "defaultValue": "",
+            "displayName": "Rule ID",
+            "name": "transformRuleId",
+            "type": "TEXT"
+          },
+          {
+            "defaultValue": "",
+            "displayName": "Match Value",
+            "name": "transformMatchValue",
+            "type": "TEXT"
+          },
+          {
+            "defaultValue": "set_null",
+            "displayName": "Action",
+            "name": "transformAction",
+            "type": "SELECT",
+            "selectItems": [
+              {
+                "value": "set_null",
+                "displayValue": "Set null"
+              },
+              {
+                "value": "omit",
+                "displayValue": "Omit key"
+              },
+              {
+                "value": "replace",
+                "displayValue": "Replace"
+              }
+            ]
+          },
+          {
+            "defaultValue": "",
+            "displayName": "Replace With",
+            "name": "transformReplaceWith",
+            "type": "TEXT"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "type": "GROUP",
     "name": "groupSettings",
     "displayName": "Settings",
     "groupStyle": "ZIPPY_OPEN",
@@ -168,7 +297,7 @@ ___TEMPLATE_PARAMETERS___
         "checkboxText": "Sparse output (omit empty values)",
         "simpleValueType": true,
         "defaultValue": true,
-        "help": "Sparse output is always active: undefined, null, empty and whitespace-only strings are omitted. 0, false, \\\"0\\\", \\\"false\\\", [] and {} are kept. Explicit JSON null requires type Null (null_value)."
+        "help": "Sparse output is always active for empty mapped values: undefined, empty and whitespace-only strings are omitted. 0, false, \\\"0\\\", \\\"false\\\", [] and {} are kept. Explicit JSON null is kept for type Null and transform action Set null (downstream tags such as BigQuery Data Dispatcher may still drop null keys)."
       },
       {
         "type": "CHECKBOX",
@@ -244,6 +373,176 @@ function logInvalidMappedValue(section, key, typeId, reason) {
       ' type=' + typeId + ';' +
       ' reason=' + reason
   );
+}
+
+/**
+ * Compile transform rules.
+ * Keys + Actions joined by Rule ID (1:n — multiple actions per key rule).
+ * Case (match mode) lives on the Keys row; applies to all actions of that ID.
+ * Order: Keys table order, then Actions table order. First match wins.
+ */
+function compileTransformRules(keyRows, actionRows) {
+  var compiled = [];
+  if (!keyRows || !keyRows.length) {
+    return compiled;
+  }
+
+  var actionsById = {};
+  if (actionRows && actionRows.length) {
+    for (var a = 0; a < actionRows.length; a++) {
+      var actionRow = actionRows[a];
+      if (!actionRow || !actionRow.transformRuleId) {
+        continue;
+      }
+      var actionRuleId = ('' + actionRow.transformRuleId).trim();
+      if (!actionRuleId) {
+        continue;
+      }
+      if (!actionsById[actionRuleId]) {
+        actionsById[actionRuleId] = [];
+      }
+      actionsById[actionRuleId].push(actionRow);
+    }
+  }
+
+  for (var r = 0; r < keyRows.length; r++) {
+    var keyRow = keyRows[r];
+    if (!keyRow || !keyRow.transformRuleId) {
+      continue;
+    }
+
+    var ruleId = ('' + keyRow.transformRuleId).trim();
+    if (!ruleId) {
+      continue;
+    }
+
+    var matchedActions = actionsById[ruleId];
+    if (!matchedActions || !matchedActions.length) {
+      continue;
+    }
+
+    var keyScope = keyRow.transformKeyScope || 'all';
+    var keyPattern = keyRow.transformKeyPattern
+      ? ('' + keyRow.transformKeyPattern).trim()
+      : '';
+    var matchMode = keyRow.transformMatchMode || 'exact_ci';
+
+    for (var i = 0; i < matchedActions.length; i++) {
+      var matchedAction = matchedActions[i];
+      var action = matchedAction.transformAction || '';
+      var matchValue = matchedAction.transformMatchValue;
+
+      if (!action) {
+        continue;
+      }
+      if (matchValue === undefined || matchValue === null) {
+        continue;
+      }
+
+      compiled.push({
+        ruleId: ruleId,
+        keyScope: keyScope,
+        keyPattern: keyPattern,
+        matchValue: matchValue,
+        matchMode: matchMode,
+        action: action,
+        replaceWith: matchedAction.transformReplaceWith
+      });
+    }
+  }
+
+  return compiled;
+}
+
+function keyMatchesScope(key, scope, pattern) {
+  if (!key) {
+    return false;
+  }
+
+  if (scope === 'all' || !scope) {
+    return true;
+  }
+
+  if (scope === 'exact') {
+    return pattern !== '' && key === pattern;
+  }
+
+  if (scope === 'prefix') {
+    if (!pattern) {
+      return false;
+    }
+    return key.indexOf(pattern) === 0;
+  }
+
+  if (scope === 'list') {
+    if (!pattern) {
+      return false;
+    }
+    var parts = pattern.split(',');
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i].trim();
+      if (part && key === part) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  return false;
+}
+
+function valueMatchesRule(rawValue, matchValue, matchMode) {
+  // Only string-like sentinel matching for V1 (e.g. "not set").
+  // Non-string raw values are coerced to string for comparison.
+  if (rawValue === undefined || rawValue === null) {
+    return false;
+  }
+
+  var rawStr = '' + rawValue;
+  var matchStr = '' + matchValue;
+
+  if (matchMode === 'exact') {
+    return rawStr === matchStr;
+  }
+
+  // Default: exact_ci — trim + case-insensitive
+  return rawStr.trim().toLowerCase() === matchStr.trim().toLowerCase();
+}
+
+/**
+ * Apply first matching transform rule.
+ * Returns:
+ *   { kind: 'passthrough', value }
+ *   { kind: 'omit' }
+ *   { kind: 'set_null' }
+ *   { kind: 'replace', value }
+ */
+function applyTransforms(rawValue, key, transformRules) {
+  if (!transformRules || !transformRules.length) {
+    return { kind: 'passthrough', value: rawValue };
+  }
+
+  for (var i = 0; i < transformRules.length; i++) {
+    var rule = transformRules[i];
+    if (!keyMatchesScope(key, rule.keyScope, rule.keyPattern)) {
+      continue;
+    }
+    if (!valueMatchesRule(rawValue, rule.matchValue, rule.matchMode)) {
+      continue;
+    }
+
+    if (rule.action === 'omit') {
+      return { kind: 'omit' };
+    }
+    if (rule.action === 'set_null') {
+      return { kind: 'set_null' };
+    }
+    if (rule.action === 'replace') {
+      return { kind: 'replace', value: rule.replaceWith };
+    }
+  }
+
+  return { kind: 'passthrough', value: rawValue };
 }
 
 /**
@@ -353,22 +652,34 @@ function convertMappedValue(rawValue, typeId) {
 
 /**
  * Try to map one configured value. Returns undefined when skipped.
- * null_value always yields null (explicit JSON null).
+ * Pipeline: transforms → null_value type → sparse → type cast.
  */
-function mapConfiguredValue(rawValue, typeId, section, key) {
+function mapConfiguredValue(rawValue, typeId, section, key, transformRules) {
   var t = typeId || 'string';
 
-  // Explicit null only via null_value — independent of input emptiness.
+  // 1) Value transforms (before sparse / type cast)
+  var transformed = applyTransforms(rawValue, key, transformRules);
+  if (transformed.kind === 'omit') {
+    return undefined;
+  }
+  if (transformed.kind === 'set_null') {
+    return null;
+  }
+
+  var value = transformed.value;
+
+  // 2) Explicit null type — independent of input emptiness
   if (t === 'null_value') {
     return null;
   }
 
-  // Sparse: omit empty mapped values.
-  if (isEmptyMappedValue(rawValue)) {
+  // 3) Sparse: omit empty mapped values
+  if (isEmptyMappedValue(value)) {
     return undefined;
   }
 
-  var converted = convertMappedValue(rawValue, t);
+  // 4) Strict type conversion
+  var converted = convertMappedValue(value, t);
   if (!converted.ok) {
     logInvalidMappedValue(section, key, t, converted.reason);
     return undefined;
@@ -421,8 +732,9 @@ function sortObjectKeys(obj) {
  * Later empty/invalid values do not delete an earlier valid value.
  *
  * Grouped objects override flat keys with the same name.
+ * Group field keys for transforms use "groupName.groupKey".
  */
-function buildJsonObject(flatRows, groupRows, sortKeys) {
+function buildJsonObject(flatRows, groupRows, sortKeys, transformRules) {
   var obj = {};
 
   // --- 1) Flat fields ---
@@ -438,10 +750,11 @@ function buildJsonObject(flatRows, groupRows, sortKeys) {
         row.builderValue,
         row.builderType,
         'flat',
-        key
+        key,
+        transformRules
       );
 
-      // undefined = skip (empty or invalid); null from null_value is kept
+      // undefined = skip (empty or invalid); null from null_value / set_null is kept
       if (mapped === undefined) {
         continue;
       }
@@ -466,7 +779,8 @@ function buildJsonObject(flatRows, groupRows, sortKeys) {
         gRow.builderGroupValue,
         gRow.builderGroupType,
         'group',
-        groupName + '.' + gKey
+        groupName + '.' + gKey,
+        transformRules
       );
 
       if (gMapped === undefined) {
@@ -545,7 +859,12 @@ var outputMode = data.builderOutputMode || 'native_object';
 var outputType =
   outputMode === 'json_string' ? 'json_string' : 'native_object';
 
-var obj = buildJsonObject(flatRows, groupRows, sortKeys);
+var transformRules = compileTransformRules(
+  data.builderTransformRuleKeys || [],
+  data.builderTransformRuleActions || []
+);
+
+var obj = buildJsonObject(flatRows, groupRows, sortKeys, transformRules);
 
 if (!objectHasOwnKeys(obj)) {
   debugLogSummary({}, outputType, debug);
@@ -565,33 +884,6 @@ if (outputType === 'json_string') {
 
 // Default: native object for BigQuery Data Dispatcher overrides
 return obj;
-
-
-___SERVER_PERMISSIONS___
-
-[
-  {
-    "instance": {
-      "key": {
-        "publicId": "logging",
-        "versionId": "1"
-      },
-      "param": [
-        {
-          "key": "environments",
-          "value": {
-            "type": 1,
-            "string": "all"
-          }
-        }
-      ]
-    },
-    "clientAnnotations": {
-      "isEditedByUser": true
-    },
-    "isRequired": true
-  }
-]
 
 
 ___TESTS___
@@ -886,6 +1178,238 @@ scenarios:
     });
     assertThat(getType(result.user)).isEqualTo('object');
     assertThat(result.user.id).isEqualTo('123');
+
+- name: Transform not set to null by prefix
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'form_type', builderValue: 'not set', builderType: 'string'},
+        {builderKey: 'form_campus', builderValue: 'Berlin', builderType: 'string'},
+        {builderKey: 'other', builderValue: 'not set', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'r1',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'form_',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'not set',
+          transformAction: 'set_null'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({
+      form_type: null,
+      form_campus: 'Berlin',
+      other: 'not set'
+    });
+- name: Transform multiple match values per Rule ID
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'form_type', builderValue: 'not set', builderType: 'string'},
+        {builderKey: 'form_campus', builderValue: '(not set)', builderType: 'string'},
+        {builderKey: 'form_ok', builderValue: 'Berlin', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'forms_null',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'form_',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'forms_null',
+          transformMatchValue: 'not set',
+          transformAction: 'set_null'
+        },
+        {
+          transformRuleId: 'forms_null',
+          transformMatchValue: '(not set)',
+          transformAction: 'set_null'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({
+      form_type: null,
+      form_campus: null,
+      form_ok: 'Berlin'
+    });
+- name: Transform not set omit by prefix
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'form_type', builderValue: 'not set', builderType: 'string'},
+        {builderKey: 'form_campus', builderValue: 'Berlin', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'r1',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'form_',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'not set',
+          transformAction: 'omit'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({form_campus: 'Berlin'});
+- name: Transform replace value
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'status', builderValue: 'n/a', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {transformRuleId: 'r1', transformKeyScope: 'all', transformMatchMode: 'exact_ci'}
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'n/a',
+          transformAction: 'replace',
+          transformReplaceWith: 'unknown'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({status: 'unknown'});
+- name: Rule without matching action is ignored
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'form_type', builderValue: 'not set', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'orphan',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'form_',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: []
+    });
+    assertThat(result).isEqualTo({form_type: 'not set'});
+- name: First matching transform rule wins
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'form_type', builderValue: 'not set', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'r1',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'form_',
+          transformMatchMode: 'exact_ci'
+        },
+        {
+          transformRuleId: 'r2',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'form_',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'not set',
+          transformAction: 'set_null'
+        },
+        {
+          transformRuleId: 'r2',
+          transformMatchValue: 'not set',
+          transformAction: 'omit'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({form_type: null});
+- name: Transform before number cast
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'form_value', builderValue: 'not set', builderType: 'number'},
+        {builderKey: 'ok_value', builderValue: '12', builderType: 'number'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'r1',
+          transformKeyScope: 'exact',
+          transformKeyPattern: 'form_value',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'not set',
+          transformAction: 'set_null'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({form_value: null, ok_value: 12});
+- name: Transform key list scope
+  code: |
+    const result = runCode({
+      builderFields: [
+        {builderKey: 'a', builderValue: 'not set', builderType: 'string'},
+        {builderKey: 'b', builderValue: 'not set', builderType: 'string'},
+        {builderKey: 'c', builderValue: 'not set', builderType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'r1',
+          transformKeyScope: 'list',
+          transformKeyPattern: 'a, c',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'not set',
+          transformAction: 'omit'
+        }
+      ]
+    });
+    assertThat(result).isEqualTo({b: 'not set'});
+- name: Transform applies to group key path
+  code: |
+    const result = runCode({
+      builderGroups: [
+        {builderGroupName: 'user', builderGroupKey: 'id', builderGroupValue: 'not set', builderGroupType: 'string'},
+        {builderGroupName: 'user', builderGroupKey: 'email', builderGroupValue: 'a@b.c', builderGroupType: 'string'}
+      ],
+      builderTransformRuleKeys: [
+        {
+          transformRuleId: 'r1',
+          transformKeyScope: 'prefix',
+          transformKeyPattern: 'user.',
+          transformMatchMode: 'exact_ci'
+        }
+      ],
+      builderTransformRuleActions: [
+        {
+          transformRuleId: 'r1',
+          transformMatchValue: 'not set',
+          transformAction: 'set_null'
+        }
+      ]
+    });
+    assertThat(result.user.id).isEqualTo(null);
+    assertThat(result.user.email).isEqualTo('a@b.c');
 
 
 ___NOTES___

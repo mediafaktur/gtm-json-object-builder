@@ -54,6 +54,176 @@ function logInvalidMappedValue(section, key, typeId, reason) {
 }
 
 /**
+ * Compile transform rules.
+ * Keys + Actions joined by Rule ID (1:n — multiple actions per key rule).
+ * Case (match mode) lives on the Keys row; applies to all actions of that ID.
+ * Order: Keys table order, then Actions table order. First match wins.
+ */
+function compileTransformRules(keyRows, actionRows) {
+  var compiled = [];
+  if (!keyRows || !keyRows.length) {
+    return compiled;
+  }
+
+  var actionsById = {};
+  if (actionRows && actionRows.length) {
+    for (var a = 0; a < actionRows.length; a++) {
+      var actionRow = actionRows[a];
+      if (!actionRow || !actionRow.transformRuleId) {
+        continue;
+      }
+      var actionRuleId = ('' + actionRow.transformRuleId).trim();
+      if (!actionRuleId) {
+        continue;
+      }
+      if (!actionsById[actionRuleId]) {
+        actionsById[actionRuleId] = [];
+      }
+      actionsById[actionRuleId].push(actionRow);
+    }
+  }
+
+  for (var r = 0; r < keyRows.length; r++) {
+    var keyRow = keyRows[r];
+    if (!keyRow || !keyRow.transformRuleId) {
+      continue;
+    }
+
+    var ruleId = ('' + keyRow.transformRuleId).trim();
+    if (!ruleId) {
+      continue;
+    }
+
+    var matchedActions = actionsById[ruleId];
+    if (!matchedActions || !matchedActions.length) {
+      continue;
+    }
+
+    var keyScope = keyRow.transformKeyScope || 'all';
+    var keyPattern = keyRow.transformKeyPattern
+      ? ('' + keyRow.transformKeyPattern).trim()
+      : '';
+    var matchMode = keyRow.transformMatchMode || 'exact_ci';
+
+    for (var i = 0; i < matchedActions.length; i++) {
+      var matchedAction = matchedActions[i];
+      var action = matchedAction.transformAction || '';
+      var matchValue = matchedAction.transformMatchValue;
+
+      if (!action) {
+        continue;
+      }
+      if (matchValue === undefined || matchValue === null) {
+        continue;
+      }
+
+      compiled.push({
+        ruleId: ruleId,
+        keyScope: keyScope,
+        keyPattern: keyPattern,
+        matchValue: matchValue,
+        matchMode: matchMode,
+        action: action,
+        replaceWith: matchedAction.transformReplaceWith
+      });
+    }
+  }
+
+  return compiled;
+}
+
+function keyMatchesScope(key, scope, pattern) {
+  if (!key) {
+    return false;
+  }
+
+  if (scope === 'all' || !scope) {
+    return true;
+  }
+
+  if (scope === 'exact') {
+    return pattern !== '' && key === pattern;
+  }
+
+  if (scope === 'prefix') {
+    if (!pattern) {
+      return false;
+    }
+    return key.indexOf(pattern) === 0;
+  }
+
+  if (scope === 'list') {
+    if (!pattern) {
+      return false;
+    }
+    var parts = pattern.split(',');
+    for (var i = 0; i < parts.length; i++) {
+      var part = parts[i].trim();
+      if (part && key === part) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  return false;
+}
+
+function valueMatchesRule(rawValue, matchValue, matchMode) {
+  // Only string-like sentinel matching for V1 (e.g. "not set").
+  // Non-string raw values are coerced to string for comparison.
+  if (rawValue === undefined || rawValue === null) {
+    return false;
+  }
+
+  var rawStr = '' + rawValue;
+  var matchStr = '' + matchValue;
+
+  if (matchMode === 'exact') {
+    return rawStr === matchStr;
+  }
+
+  // Default: exact_ci — trim + case-insensitive
+  return rawStr.trim().toLowerCase() === matchStr.trim().toLowerCase();
+}
+
+/**
+ * Apply first matching transform rule.
+ * Returns:
+ *   { kind: 'passthrough', value }
+ *   { kind: 'omit' }
+ *   { kind: 'set_null' }
+ *   { kind: 'replace', value }
+ */
+function applyTransforms(rawValue, key, transformRules) {
+  if (!transformRules || !transformRules.length) {
+    return { kind: 'passthrough', value: rawValue };
+  }
+
+  for (var i = 0; i < transformRules.length; i++) {
+    var rule = transformRules[i];
+    if (!keyMatchesScope(key, rule.keyScope, rule.keyPattern)) {
+      continue;
+    }
+    if (!valueMatchesRule(rawValue, rule.matchValue, rule.matchMode)) {
+      continue;
+    }
+
+    if (rule.action === 'omit') {
+      return { kind: 'omit' };
+    }
+    if (rule.action === 'set_null') {
+      return { kind: 'set_null' };
+    }
+    if (rule.action === 'replace') {
+      return { kind: 'replace', value: rule.replaceWith };
+    }
+  }
+
+  return { kind: 'passthrough', value: rawValue };
+}
+
+/**
  * Strict type conversion.
  * Returns { ok: true, value: ... } or { ok: false, reason: '...' }.
  *
@@ -160,22 +330,34 @@ function convertMappedValue(rawValue, typeId) {
 
 /**
  * Try to map one configured value. Returns undefined when skipped.
- * null_value always yields null (explicit JSON null).
+ * Pipeline: transforms → null_value type → sparse → type cast.
  */
-function mapConfiguredValue(rawValue, typeId, section, key) {
+function mapConfiguredValue(rawValue, typeId, section, key, transformRules) {
   var t = typeId || 'string';
 
-  // Explicit null only via null_value — independent of input emptiness.
+  // 1) Value transforms (before sparse / type cast)
+  var transformed = applyTransforms(rawValue, key, transformRules);
+  if (transformed.kind === 'omit') {
+    return undefined;
+  }
+  if (transformed.kind === 'set_null') {
+    return null;
+  }
+
+  var value = transformed.value;
+
+  // 2) Explicit null type — independent of input emptiness
   if (t === 'null_value') {
     return null;
   }
 
-  // Sparse: omit empty mapped values.
-  if (isEmptyMappedValue(rawValue)) {
+  // 3) Sparse: omit empty mapped values
+  if (isEmptyMappedValue(value)) {
     return undefined;
   }
 
-  var converted = convertMappedValue(rawValue, t);
+  // 4) Strict type conversion
+  var converted = convertMappedValue(value, t);
   if (!converted.ok) {
     logInvalidMappedValue(section, key, t, converted.reason);
     return undefined;
@@ -228,8 +410,9 @@ function sortObjectKeys(obj) {
  * Later empty/invalid values do not delete an earlier valid value.
  *
  * Grouped objects override flat keys with the same name.
+ * Group field keys for transforms use "groupName.groupKey".
  */
-function buildJsonObject(flatRows, groupRows, sortKeys) {
+function buildJsonObject(flatRows, groupRows, sortKeys, transformRules) {
   var obj = {};
 
   // --- 1) Flat fields ---
@@ -245,10 +428,11 @@ function buildJsonObject(flatRows, groupRows, sortKeys) {
         row.builderValue,
         row.builderType,
         'flat',
-        key
+        key,
+        transformRules
       );
 
-      // undefined = skip (empty or invalid); null from null_value is kept
+      // undefined = skip (empty or invalid); null from null_value / set_null is kept
       if (mapped === undefined) {
         continue;
       }
@@ -273,7 +457,8 @@ function buildJsonObject(flatRows, groupRows, sortKeys) {
         gRow.builderGroupValue,
         gRow.builderGroupType,
         'group',
-        groupName + '.' + gKey
+        groupName + '.' + gKey,
+        transformRules
       );
 
       if (gMapped === undefined) {
@@ -352,7 +537,12 @@ var outputMode = data.builderOutputMode || 'native_object';
 var outputType =
   outputMode === 'json_string' ? 'json_string' : 'native_object';
 
-var obj = buildJsonObject(flatRows, groupRows, sortKeys);
+var transformRules = compileTransformRules(
+  data.builderTransformRuleKeys || [],
+  data.builderTransformRuleActions || []
+);
+
+var obj = buildJsonObject(flatRows, groupRows, sortKeys, transformRules);
 
 if (!objectHasOwnKeys(obj)) {
   debugLogSummary({}, outputType, debug);
